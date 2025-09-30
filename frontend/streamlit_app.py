@@ -151,9 +151,8 @@ if symbol:
                         options_data = get_options_data(symbol)
                     else:
                         st.success(f"✅ Loaded options for {selected_exp_date}")
-                        # Update current expiration info
+                        # Update current expiration info for display
                         current_exp_date = selected_exp_date
-                        st.rerun()  # Refresh to show new data
             
             # Current Selection Info
             st.subheader("📊 Current Options Chain")
@@ -166,15 +165,16 @@ if symbol:
                 days_to_exp = options_data.get('days_to_expiration', 0)
                 st.metric("Days to Expiration", f"{days_to_exp} days")
             with col3:
-                # Find current expiration category
+                # Find current expiration category from the updated data
+                current_exp_from_data = options_data.get('expiration_date', 'N/A')
                 current_category = "Unknown"
-                for exp_info in available_exps:
-                    if exp_info['date'] == current_exp_date:
+                for exp_info in options_data.get('available_expirations', []):
+                    if exp_info['date'] == current_exp_from_data:
                         current_category = exp_info['category'].title()
                         break
                 st.metric("Category", current_category)
             with col4:
-                st.metric("Total Expirations", len(available_exps))
+                st.metric("Total Expirations", len(options_data.get('available_expirations', [])))
             
             # Create tabs for calls and puts
             call_tab, put_tab = st.tabs(["📈 Calls", "📉 Puts"])
