@@ -25,8 +25,8 @@ async def get_stock_price(symbol: str):
         return {"error": str(e)}
     
 @app.get("/options/{symbol}")
-async def get_options_chain(symbol: str):
-    """Get options chain for a symbol"""
+async def get_options_chain(symbol: str, expiration: str = None):
+    """Get options chain for a symbol with optional expiration date"""
     try:
         print(f"Fetching options for symbol: {symbol}")
         ticker = yf.Ticker(symbol)
@@ -46,21 +46,30 @@ async def get_options_chain(symbol: str):
         if not expirations:
             return {"error": "No options data available for this symbol"}
         
-        # Find the first non-expired expiration date
-        exp_date = None
-        today = pd.Timestamp.now().date()
-        print(f"Today's date: {today}")
-        
-        for exp in expirations:
-            exp_datetime = pd.to_datetime(exp).date()
-            print(f"Checking expiration: {exp} -> {exp_datetime}")
-            if exp_datetime > today:  
-                exp_date = exp
-                print(f"Selected expiration: {exp_date}")
-                break
-        
-        if not exp_date:
-            return {"error": "No active (non-expired) options available for this symbol"}
+        # Determine which expiration date to use
+        if expiration:
+            # User specified an expiration date
+            if expiration in expirations:
+                exp_date = expiration
+                print(f"Using user-specified expiration: {exp_date}")
+            else:
+                return {"error": f"Expiration date {expiration} not available for {symbol}"}
+        else:
+            # Find the first non-expired expiration date
+            exp_date = None
+            today = pd.Timestamp.now().date()
+            print(f"Today's date: {today}")
+            
+            for exp in expirations:
+                exp_datetime = pd.to_datetime(exp).date()
+                print(f"Checking expiration: {exp} -> {exp_datetime}")
+                if exp_datetime > today:  
+                    exp_date = exp
+                    print(f"Selected expiration: {exp_date}")
+                    break
+            
+            if not exp_date:
+                return {"error": "No active (non-expired) options available for this symbol"}
         
         print(f"Getting options chain for {exp_date}...")
         options_chain = ticker.option_chain(exp_date)
@@ -113,11 +122,46 @@ async def get_options_chain(symbol: str):
         
         print(f"Returning {len(relevant_calls)} relevant calls and {len(relevant_puts)} relevant puts")
         
-        # TODO: 
-        # Implement time-based filtering with metadata:
-        # - Categorize as weekly/monthly/quarterly
-        # - Add days_until_expiration field
-        # - Sort by relevance and limit to 12 most useful        
+        # Smart expiration filtering with metadata
+        def categorize_expiration(days_until_exp):
+            """Categorize expiration by time frame"""
+            if days_until_exp <= 7:
+                return "weekly"
+            elif days_until_exp <= 30:
+                return "short-term"
+            elif days_until_exp <= 90:
+                return "monthly"
+            elif days_until_exp <= 180:
+                return "quarterly"
+            else:
+                return "long-term"
+        
+        print("Creating smart expiration list with metadata...")
+        smart_expirations = []
+        today = pd.Timestamp.now().date()
+        
+        for exp in expirations:
+            exp_date_obj = pd.to_datetime(exp).date()
+            days_until_exp = (exp_date_obj - today).days
+            
+            # Include expirations within next 6 months (180 days)
+            # This covers weeklies, monthlies, and some quarterlies
+            if 0 < days_until_exp <= 180:
+                exp_category = categorize_expiration(days_until_exp)
+                smart_expirations.append({
+                    "date": exp,
+                    "days_until_expiration": days_until_exp,
+                    "category": exp_category,
+                    "is_current": exp == exp_date,
+                    "formatted_date": exp_date_obj.strftime("%b %d, %Y"),
+                    "trading_days_approx": int(days_until_exp * 5/7)  # Rough estimate excluding weekends
+                })
+        
+        # Sort by days until expiration and limit to 12 most relevant
+        smart_expirations = sorted(smart_expirations, key=lambda x: x["days_until_expiration"])[:12]
+        
+        print(f"Smart filtering returned {len(smart_expirations)} relevant expirations")
+        
         return {
             "symbol": symbol.upper(),
             "current_price": current_price,
@@ -125,7 +169,7 @@ async def get_options_chain(symbol: str):
             "days_to_expiration": days_to_exp,
             "calls": relevant_calls,  
             "puts": relevant_puts,    
-            "available_expirations": list(expirations)[:5]  # show first 5 expiration dates
+            "available_expirations": smart_expirations  # Enhanced with metadata!
         }
         
     except Exception as e:
