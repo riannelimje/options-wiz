@@ -26,10 +26,14 @@ def get_stock_data(symbol):
     except Exception as e:
         return {"error": str(e)}
 
-def get_options_data(symbol):
+def get_options_data(symbol, expiration=None):
     """Fetch options chain data from backend"""
     try:
-        response = requests.get(f"{API_BASE_URL}/options/{symbol}")
+        url = f"{API_BASE_URL}/options/{symbol}"
+        if expiration:
+            url += f"?expiration={expiration}"
+        
+        response = requests.get(url)
         if response.status_code == 200:
             return response.json()
         else:
@@ -85,14 +89,92 @@ if symbol:
             st.error(f"Options Error: {options_data['error']}")
             st.info("This stock may not have options available.")
         else:
-            # Display options chain info
-            col1, col2, col3 = st.columns(3)
+            # Smart Expiration Date Selector
+            available_exps = options_data.get('available_expirations', [])
+            current_exp_date = options_data.get('expiration_date', 'N/A')
+            
+            if len(available_exps) > 1:
+                st.subheader("📅 Select Expiration Date")
+                
+                # Create enhanced selector options with metadata
+                exp_options = {}
+                exp_labels = []
+                
+                for exp_info in available_exps:
+                    date = exp_info['date']
+                    days = exp_info['days_until_expiration']
+                    category = exp_info['category']
+                    formatted_date = exp_info['formatted_date']
+                    is_current = exp_info.get('is_current', False)
+                    
+                    # Create rich label with category emoji
+                    category_emoji = {
+                        'weekly': '⚡', 
+                        'short-term': '📅', 
+                        'monthly': '🗓️', 
+                        'quarterly': '📆'
+                    }
+                    emoji = category_emoji.get(category, '📅')
+                    
+                    # Format: "⚡ Oct 03, 2025 (3 days) - Weekly [CURRENT]"
+                    label = f"{emoji} {formatted_date} ({days} days) - {category.title()}"
+                    if is_current:
+                        label += " [CURRENT]"
+                    
+                    exp_options[label] = date
+                    exp_labels.append(label)
+                
+                # Find current selection index
+                current_index = 0
+                for i, (label, date) in enumerate(exp_options.items()):
+                    if date == current_exp_date:
+                        current_index = i
+                        break
+                
+                selected_exp_label = st.selectbox(
+                    "Choose expiration date:",
+                    options=exp_labels,
+                    index=current_index,
+                    help="📊 Categories: ⚡Weekly (≤7 days), 📅Short-term (8-30 days), 🗓️Monthly (31-90 days), 📆Quarterly (91-180 days)"
+                )
+                
+                selected_exp_date = exp_options[selected_exp_label]
+                
+                # If user selected a different expiration, fetch that data
+                if selected_exp_date != current_exp_date:
+                    with st.spinner(f"🔄 Loading options for {selected_exp_date}..."):
+                        options_data = get_options_data(symbol, selected_exp_date)
+                    
+                    if "error" in options_data:
+                        st.error(f"Error loading {selected_exp_date}: {options_data['error']}")
+                        # Fallback to original data
+                        options_data = get_options_data(symbol)
+                    else:
+                        st.success(f"✅ Loaded options for {selected_exp_date}")
+                        # Update current expiration info
+                        current_exp_date = selected_exp_date
+                        st.rerun()  # Refresh to show new data
+            
+            # Current Selection Info
+            st.subheader("📊 Current Options Chain")
+            
+            # Enhanced metrics display
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.metric("Expiration Date", options_data.get('expiration_date', 'N/A'))
             with col2:
-                st.metric("Days to Expiration", f"{options_data.get('days_to_expiration', 0)} days")
+                days_to_exp = options_data.get('days_to_expiration', 0)
+                st.metric("Days to Expiration", f"{days_to_exp} days")
             with col3:
-                st.metric("Available Expirations", len(options_data.get('available_expirations', [])))
+                # Find current expiration category
+                current_category = "Unknown"
+                for exp_info in available_exps:
+                    if exp_info['date'] == current_exp_date:
+                        current_category = exp_info['category'].title()
+                        break
+                st.metric("Category", current_category)
+            with col4:
+                st.metric("Total Expirations", len(available_exps))
             
             # Create tabs for calls and puts
             call_tab, put_tab = st.tabs(["📈 Calls", "📉 Puts"])
@@ -181,10 +263,36 @@ if symbol:
                 else:
                     st.info("No put options data available for this symbol")
             
-            # Show additional expiration dates available
-            available_exps = options_data.get('available_expirations', [])
+            # Options Summary & Tips
             if len(available_exps) > 1:
-                st.info(f"📅 Other available expiration dates: {', '.join(available_exps[1:])}")
+                st.subheader("💡 Options Trading Tips")
+                
+                # Categorize available expirations for display
+                categories = {}
+                for exp_info in available_exps:
+                    category = exp_info['category']
+                    if category not in categories:
+                        categories[category] = []
+                    categories[category].append(exp_info)
+                
+                # Display category summary
+                cols = st.columns(len(categories))
+                for i, (category, exps) in enumerate(categories.items()):
+                    with cols[i]:
+                        emoji_map = {'weekly': '⚡', 'short-term': '📅', 'monthly': '🗓️', 'quarterly': '📆'}
+                        emoji = emoji_map.get(category, '📅')
+                        st.metric(f"{emoji} {category.title()}", f"{len(exps)} options")
+                
+                # Trading insights based on current selection
+                days_to_exp = options_data.get('days_to_expiration', 0)
+                if days_to_exp <= 7:
+                    st.info("⚡ **Weekly Options**: High gamma, time decay accelerates rapidly. Great for short-term directional plays.")
+                elif days_to_exp <= 30:
+                    st.info("📅 **Short-term Options**: Balanced risk/reward. Popular for earnings plays and swing trading.")
+                elif days_to_exp <= 90:
+                    st.info("🗓️ **Monthly Options**: Good for strategies, moderate time decay. Suitable for covered calls and protective puts.")
+                else:
+                    st.info("📆 **Quarterly Options**: Lower time decay, higher premium. Good for long-term strategies and LEAPS.")
             
             # Debug section for options data
             with st.expander("Debug: Raw Options API Response"):
