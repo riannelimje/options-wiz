@@ -1,6 +1,10 @@
 from fastapi import FastAPI, HTTPException
 import yfinance as yf
 import pandas as pd
+import numpy as np
+import math
+from calculations.greeks import OptionsGreeks
+from calculations.black_scholes import BlackScholesModel, days_to_years, get_risk_free_rate
 
 app = FastAPI()
 
@@ -174,6 +178,288 @@ async def get_options_chain(symbol: str, expiration: str = None):
         
     except Exception as e:
         print(f"ERROR in get_options_chain: {str(e)}")
+        print(f"Exception type: {type(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"error": f"Internal error: {str(e)}"}
+
+@app.get("/option-pnl/{symbol}")
+async def calculate_option_pnl(
+    symbol: str,
+    option_type: str,  # "call" or "put"
+    strike: float,
+    premium: float,
+    expiration_days: int = 30
+):
+    """
+    Calculate profit/loss for a single option at various stock prices at expiration.
+    
+    Parameters:
+    - symbol: Stock symbol (e.g., AAPL)
+    - option_type: "call" or "put"
+    - strike: Strike price of the option
+    - premium: Premium paid for the option
+    - expiration_days: Days to expiration (for reference, doesn't affect P&L at expiration)
+    """
+    try:
+        print(f"Calculating P&L for {symbol} {option_type} option: Strike=${strike}, Premium=${premium}")
+        
+        # Get current stock price for reference
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
+        current_price = info.get("currentPrice", info.get("regularMarketPrice"))
+        
+        if not current_price:
+            raise HTTPException(status_code=404, detail="Stock price not found")
+        
+        print(f"Current stock price: ${current_price}")
+        
+        # Generate stock price range for P&L calculation (±50% from current price)
+        min_price = current_price * 0.5
+        max_price = current_price * 1.5
+        price_step = (max_price - min_price) / 100  # 100 data points for smooth curve
+        
+        stock_prices = []
+        pnl_values = []
+        option_values = []
+        
+        print(f"Generating P&L curve from ${min_price:.2f} to ${max_price:.2f}")
+        
+        for i in range(101):  # 101 points for 100 intervals
+            stock_price = min_price + (i * price_step)
+            stock_prices.append(round(stock_price, 2))
+            
+            # Calculate option value at expiration (intrinsic value only)
+            if option_type.lower() == "call":
+                option_value = max(0, stock_price - strike)
+            elif option_type.lower() == "put":
+                option_value = max(0, strike - stock_price)
+            else:
+                raise HTTPException(status_code=400, detail="option_type must be 'call' or 'put'")
+            
+            option_values.append(round(option_value, 2))
+            
+            # P&L = Option Value at Expiration - Premium Paid
+            pnl = option_value - premium
+            pnl_values.append(round(pnl, 2))
+        
+        # Calculate key metrics
+        max_profit = max(pnl_values)
+        max_loss = min(pnl_values)
+        
+        # Find breakeven point(s)
+        breakeven_points = []
+        for i, pnl in enumerate(pnl_values):
+            if abs(pnl) < 0.01:  # Within 1 cent of breakeven
+                breakeven_points.append(stock_prices[i])
+        
+        # Remove duplicates and keep only unique breakeven points
+        breakeven_points = list(set(breakeven_points))
+        breakeven_points.sort()
+        
+        # Calculate probability metrics (simplified)
+        current_price_index = min(range(len(stock_prices)), 
+                                key=lambda i: abs(stock_prices[i] - current_price))
+        
+        # Count profitable scenarios
+        profitable_scenarios = sum(1 for pnl in pnl_values if pnl > 0)
+        probability_of_profit = (profitable_scenarios / len(pnl_values)) * 100
+        
+        print(f"P&L calculation complete: Max Profit=${max_profit:.2f}, Max Loss=${max_loss:.2f}")
+        print(f"Breakeven points: {breakeven_points}")
+        
+        return {
+            "symbol": symbol.upper(),
+            "option_type": option_type.lower(),
+            "strike": strike,
+            "premium": premium,
+            "current_price": current_price,
+            "expiration_days": expiration_days,
+            
+            # P&L Data for Charting
+            "stock_prices": stock_prices,
+            "pnl_values": pnl_values,
+            "option_values": option_values,
+            
+            # Key Metrics
+            "max_profit": max_profit if max_profit != float('inf') else None,
+            "max_loss": max_loss,
+            "breakeven_points": breakeven_points,
+            "probability_of_profit": round(probability_of_profit, 1),
+            
+            # Additional Info
+            "price_range": {
+                "min": min_price,
+                "max": max_price,
+                "current_index": current_price_index
+            },
+            "analysis": {
+                "in_the_money": (
+                    current_price > strike if option_type.lower() == "call" 
+                    else current_price < strike
+                ),
+                "intrinsic_value": max(0, 
+                    current_price - strike if option_type.lower() == "call"
+                    else strike - current_price
+                ),
+                "time_value": premium - max(0, 
+                    current_price - strike if option_type.lower() == "call"
+                    else strike - current_price
+                )
+            }
+        }
+        
+    except Exception as e:
+        print(f"ERROR in calculate_option_pnl: {str(e)}")
+        print(f"Exception type: {type(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"error": f"Internal error: {str(e)}"}
+
+@app.get("/option-greeks/{symbol}")
+async def calculate_option_greeks(
+    symbol: str,
+    option_type: str,  # "call" or "put"
+    strike: float,
+    expiration_days: int,
+    volatility: float = None  # Optional: will estimate from market data if not provided
+):
+    """
+    Calculate Option Greeks (Delta, Gamma, Theta, Vega, Rho) for a given option.
+    
+    Parameters:
+    - symbol: Stock symbol (e.g., AAPL)
+    - option_type: "call" or "put"
+    - strike: Strike price of the option
+    - expiration_days: Days to expiration
+    - volatility: Implied volatility (optional, will estimate if not provided)
+    """
+    try:
+        print(f"Calculating Greeks for {symbol} {option_type} option: Strike=${strike}, Days={expiration_days}")
+        
+        # Get current stock price
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
+        current_price = info.get("currentPrice", info.get("regularMarketPrice"))
+        
+        if not current_price:
+            raise HTTPException(status_code=404, detail="Stock price not found")
+        
+        print(f"Current stock price: ${current_price}")
+        
+        # Convert days to years
+        time_to_expiration = days_to_years(expiration_days)
+        
+        # Get risk-free rate
+        risk_free_rate = get_risk_free_rate()
+        
+        # Estimate volatility if not provided
+        if volatility is None:
+            print("Estimating volatility from historical data...")
+            try:
+                # Get 30 days of historical data to estimate volatility
+                hist = ticker.history(period="1mo")
+                if len(hist) > 5:
+                    # Calculate daily returns
+                    returns = hist['Close'].pct_change().dropna()
+                    # Annualized volatility
+                    volatility = returns.std() * math.sqrt(252)  # 252 trading days per year
+                    print(f"Estimated volatility: {volatility:.4f} ({volatility*100:.2f}%)")
+                else:
+                    volatility = 0.25  # Default 25% if can't calculate
+                    print("Using default volatility: 25%")
+            except Exception as e:
+                print(f"Error estimating volatility: {e}, using default 25%")
+                volatility = 0.25
+        else:
+            print(f"Using provided volatility: {volatility:.4f} ({volatility*100:.2f}%)")
+        
+        # Calculate all Greeks
+        greeks = OptionsGreeks.calculate_greeks(
+            option_type=option_type.lower(),
+            S=current_price,
+            K=strike,
+            T=time_to_expiration,
+            r=risk_free_rate,
+            sigma=volatility
+        )
+        
+        # Get interpretations
+        interpretations = OptionsGreeks.interpret_greeks(greeks, option_type.lower())
+        
+        # Calculate theoretical option price using Black-Scholes
+        theoretical_price = BlackScholesModel.option_price(
+            option_type=option_type.lower(),
+            S=current_price,
+            K=strike,
+            T=time_to_expiration,
+            r=risk_free_rate,
+            sigma=volatility
+        )
+        
+        # Calculate intrinsic value
+        if option_type.lower() == "call":
+            intrinsic_value = max(0, current_price - strike)
+        else:  # put
+            intrinsic_value = max(0, strike - current_price)
+        
+        # Time value is the difference
+        time_value = max(0, theoretical_price - intrinsic_value)
+        
+        print(f"Greeks calculation complete: Delta={greeks['delta']:.4f}, Theta=${greeks['theta']:.4f}")
+        
+        return {
+            "symbol": symbol.upper(),
+            "option_type": option_type.lower(),
+            "strike": strike,
+            "current_price": current_price,
+            "expiration_days": expiration_days,
+            "time_to_expiration_years": round(time_to_expiration, 4),
+            
+            # Market Parameters
+            "market_params": {
+                "volatility": round(volatility, 4),
+                "volatility_percent": round(volatility * 100, 2),
+                "risk_free_rate": round(risk_free_rate, 4),
+                "risk_free_rate_percent": round(risk_free_rate * 100, 2)
+            },
+            
+            # Option Pricing
+            "pricing": {
+                "theoretical_price": round(theoretical_price, 2),
+                "intrinsic_value": round(intrinsic_value, 2),
+                "time_value": round(time_value, 2),
+                "moneyness": "ITM" if intrinsic_value > 0 else "ATM" if abs(current_price - strike) < 1 else "OTM"
+            },
+            
+            # Greeks
+            "greeks": {
+                "delta": round(greeks["delta"], 4),
+                "gamma": round(greeks["gamma"], 4),
+                "theta": round(greeks["theta"], 4),
+                "vega": round(greeks["vega"], 4),
+                "rho": round(greeks["rho"], 4)
+            },
+            
+            # Human-readable interpretations
+            "interpretations": interpretations,
+            
+            # Additional Analysis
+            "analysis": {
+                "delta_dollar_equivalent": round(greeks["delta"] * 100, 2),  # Per 100 shares
+                "gamma_acceleration": "High" if greeks["gamma"] > 0.1 else "Moderate" if greeks["gamma"] > 0.05 else "Low",
+                "theta_daily_decay": round(greeks["theta"], 2),
+                "vega_iv_sensitivity": round(greeks["vega"] * 100, 2),  # For 100% IV change
+                "rho_rate_sensitivity": round(greeks["rho"] * 100, 2),  # For 100bp rate change
+                
+                # Risk metrics
+                "time_decay_risk": "High" if abs(greeks["theta"]) > 0.5 else "Moderate" if abs(greeks["theta"]) > 0.1 else "Low",
+                "volatility_risk": "High" if greeks["vega"] > 0.2 else "Moderate" if greeks["vega"] > 0.1 else "Low"
+            }
+        }
+        
+    except Exception as e:
+        print(f"ERROR in calculate_option_greeks: {str(e)}")
         print(f"Exception type: {type(e)}")
         import traceback
         traceback.print_exc()
